@@ -1,0 +1,143 @@
+---
+title: "assignment06"
+author: "Yixuan Li & Savanna Li"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+execute:
+  warning: false
+bibliography: references.bib
+---
+
+## 
+
+```{r}
+library(tidyverse)
+library(readr)
+library(here)
+library(tidymodels)
+```
+
+```{r}
+# Import and tidy the data
+final_cc_data <- read_csv(
+  here("data", "final_cc_data.csv")) %>%
+  filter(!is.na(tetra_corr)) %>%
+  select(tetra_corr, totnpcc_cc_offenses_vc, totnpcc_ncc_offenses_vc, cincome) %>%
+  na.omit()
+# needs further selecting variables
+```
+
+```{r}
+# Split the data
+set.seed(20231201)
+crime_split <- initial_split(data = final_cc_data, prop = 0.75)
+crime_train <- training(x = crime_split)
+crime_test <- training(x = crime_split)
+```
+
+```{r}
+# EDA
+crime_train %>%
+  ggplot(aes(x = tetra_corr, y = totnpcc_cc_offenses_vc)) +
+  geom_point() +
+  labs(title = "Lead Amount and Violent Crime per Inhabitant in the City Center")
+
+crime_train %>%
+  ggplot(aes(x = tetra_corr, y = totnpcc_ncc_offenses_vc)) +
+  geom_point() +
+  labs(title = "Lead Amount and Violent Crime per Inhabitant in the Suburb")
+```
+
+```{r}
+# Preparation
+crime_rec <- recipe(formula = totnpcc_cc_offenses_vc ~., data = crime_train)
+
+folds <- vfold_cv(data = crime_train, v = 10)
+```
+
+```{r}
+# Linear Regression Model
+lm_mod <- linear_reg() %>%
+  set_engine(engine = "lm")
+
+lm_wf <- workflow() %>%
+  add_recipe(crime_rec) %>%
+  add_model(lm_mod)
+
+lm_cv <- lm_wf %>%
+  fit_resamples(resamples = folds)
+
+lm_best <- lm_cv %>%
+  select_best(metric = "rmse")
+
+lm_final <- finalize_workflow(
+  lm_wf,
+  parameters = lm_best
+)
+
+lm_fit <- lm_final %>%
+  fit(data = crime_train)
+
+# Prediction
+lm_pred <- lm_fit %>%
+  predict(new_data = crime_test)
+```
+
+```{r}
+# Random Forest Model
+rand_mod <- rand_forest(mode = "regression", trees = 500) %>%
+  set_engine("ranger")
+
+rand_wf <- workflow() %>%
+  add_recipe(crime_rec) %>%
+  add_model(rand_mod)
+
+rand_cv <- rand_wf %>%
+  fit_resamples(resamples = folds)
+
+rand_best <- rand_cv %>%
+  select_best(metric = "rmse")
+
+rand_final <- finalize_workflow(
+  rand_wf,
+  parameters = rand_best
+)
+
+rand_fit <- rand_final %>%
+  fit(data = crime_train)
+
+# Prediction
+rand_pred <- rand_fit %>%
+  predict(new_data = crime_test)
+```
+
+```{r}
+# KNN Model
+knn_mod <- nearest_neighbor(neighbors = 5) %>%
+  set_engine(engine = "kknn") %>%
+  set_mode(mode = "regression")
+
+knn_wf <- workflow() %>%
+  add_recipe(crime_rec) %>%
+  add_model(knn_mod)
+
+knn_cv <- knn_wf %>%
+  fit_resamples(resamples = folds)
+
+knn_best <- knn_cv %>%
+  select_best(metric = "rmse")
+
+knn_final <- finalize_workflow(
+  knn_wf,
+  parameters = knn_best
+)
+
+knn_fit <- knn_final %>%
+  fit(data = crime_train)
+
+# Prediction
+knn_pred <- knn_fit %>%
+  predict(new_data = crime_test)
+```
