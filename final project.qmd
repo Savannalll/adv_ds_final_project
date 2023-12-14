@@ -17,44 +17,130 @@ library(tidyverse)
 library(readr)
 library(here)
 library(tidymodels)
+library(parsnip)
 ```
+
+# **Data cleaning**
 
 ```{r}
 # Import and tidy the data
+original_data <- read_csv(
+  here("data", "final_cc_data.csv"))
+
+# intuitively pick predictors
 final_cc_data <- read_csv(
   here("data", "final_cc_data.csv")) %>%
-  filter(!is.na(tetra_corr)) %>%
-  select(tetra_corr, totnpcc_cc_offenses_vc, totnpcc_ncc_offenses_vc, cincome) %>%
-  na.omit()
-# needs further selecting variables
+  select(fipsplace_00, year, tot_cc_oripop_corr, tot_ncc_oripop_corr,
+         totnpcc_cc_offenses_vc, totnpcc_ncc_offenses_vc, pctblk, rays_planc, racc)
+
+for (i in 1:ncol(final_cc_data)) {
+    final_cc_data[is.na(final_cc_data[, i]), i] <- colMeans(final_cc_data[, i], na.rm = TRUE)
+ }
+
+lead <- read_csv(
+  here("data", "final_cc_data.csv")) %>%
+  select(fipsplace_00, year, ph1_plc_wtm_wtm_0_r, tetra_corr) %>%
+  mutate(cor_year = year + 19) %>%
+  select(!year)
+
+
+train <- final_cc_data %>%
+  filter(year >= 1979 & year <= 2007)
+
+test <- final_cc_data %>%
+  filter(year >= 2008 & year <= 2014)
+
+
+
 ```
 
 ```{r}
-# Split the data
-set.seed(20231201)
-crime_split <- initial_split(data = final_cc_data, prop = 0.75)
-crime_train <- training(x = crime_split)
-crime_test <- training(x = crime_split)
+
+# all the variables (random forest importance)
+total_combined_data <- original_data %>%
+  left_join(cbp, by = c("fipsplace_00", "year")) %>%
+  left_join(income, by = c("fipsplace_00", "year")) %>%
+  left_join(shblack, by = c("fipsplace_00", "year")) %>%
+  left_join(lead, by = c("fipsplace_00" = "fipsplace_00", "year" = "cor_year"))
+
+#cols_num <- which(sapply(total_combined_data, is.numeric))  
+#total_combined_data = total_combined_data[cols_num]
+
+#for (i in 1:ncol(total_combined_data)) {
+  #if (is.numeric(total_combined_data[, i])) {
+    #total_combined_data[is.na(total_combined_data[, i]), i] <- colMeans(total_combined_data[, i], na.rm = TRUE)
+# }
+#}
+
+
+#cbp <- read_dta("data/data_cbp.dta") %>%
+  #select(fipsplace_00, year, perc_empl_ctycc_sic0)
+
+income <- read_dta("data/LR_income.dta")
+
+shblack <- read_dta("data/LR_shblack.dta")
+
+# only selected predictors
+combined_data <- final_cc_data %>%
+  left_join(cbp, by = c("fipsplace_00", "year")) %>%
+  left_join(income, by = c("fipsplace_00", "year")) %>%
+  left_join(shblack, by = c("fipsplace_00", "year")) %>%
+  left_join(lead, by = c("fipsplace_00" = "fipsplace_00", "year" = "cor_year"))
+
+```
+
+# **EDA**
+
+```{r}
+
+
+
+final_cc_data <- final_cc_data %>%
+group_by(year) %>%
+summarize(across(everything(), ~ sum(!is.na(.))))
+
+ggplot(final_cc_data, aes(x = year, y = tot_cc_oripop_corr)) +
+  geom_point() +
+  scale_x_continuous(
+    breaks = seq(min(final_cc_data$year), max(final_cc_data$year), by = 5)
+  ) 
+
+ggplot(final_cc_data, aes(x = year, y = tot_ncc_oripop_corr)) +
+geom_point() +
+ scale_x_continuous(
+    breaks = seq(min(final_cc_data$year), max(final_cc_data$year), by = 5)
+  ) 
+
+ggplot(lead, aes(x = cor_year, y = ph1_plc_wtm_wtm_0_r)) +
+geom_point() +
+ scale_x_continuous(
+    breaks = seq(min(lead$cor_year), max(lead$cor_year), by = 5)
+  ) 
+
+ggplot(final_cc_data, aes(x = year, y = totnpcc_cc_offenses_vc)) +
+geom_point() +
+ scale_x_continuous(
+    breaks = seq(min(final_cc_data$year), max(final_cc_data$year), by = 5)
+  ) 
+
+ggplot(final_cc_data, aes(x = year, y = totnpcc_ncc_offenses_vc)) +
+geom_point() +
+ scale_x_continuous(
+    breaks = seq(min(final_cc_data$year), max(final_cc_data$year), by = 5)
+  ) 
+
+
 ```
 
 ```{r}
-# EDA
-crime_train %>%
-  ggplot(aes(x = tetra_corr, y = totnpcc_cc_offenses_vc)) +
-  geom_point() +
-  labs(title = "Lead Amount and Violent Crime per Inhabitant in the City Center")
-
-crime_train %>%
-  ggplot(aes(x = tetra_corr, y = totnpcc_ncc_offenses_vc)) +
-  geom_point() +
-  labs(title = "Lead Amount and Violent Crime per Inhabitant in the Suburb")
+view(final_cc_data)
 ```
 
 ```{r}
 # Preparation
-crime_rec <- recipe(formula = totnpcc_cc_offenses_vc ~., data = crime_train)
+suburbanization_rec <- recipe(formula = tot_cc_oripop_corr ~., data = train)
 
-folds <- vfold_cv(data = crime_train, v = 10)
+folds <- vfold_cv(data = train, v = 5)
 ```
 
 ```{r}
@@ -63,7 +149,7 @@ lm_mod <- linear_reg() %>%
   set_engine(engine = "lm")
 
 lm_wf <- workflow() %>%
-  add_recipe(crime_rec) %>%
+  add_recipe(suburbanization_rec) %>%
   add_model(lm_mod)
 
 lm_cv <- lm_wf %>%
@@ -78,11 +164,13 @@ lm_final <- finalize_workflow(
 )
 
 lm_fit <- lm_final %>%
-  fit(data = crime_train)
+  fit(data = train)
 
 # Prediction
 lm_pred <- lm_fit %>%
-  predict(new_data = crime_test)
+  predict(new_data = test)
+
+
 ```
 
 ```{r}
@@ -91,7 +179,7 @@ rand_mod <- rand_forest(mode = "regression", trees = 500) %>%
   set_engine("ranger")
 
 rand_wf <- workflow() %>%
-  add_recipe(crime_rec) %>%
+  add_recipe(suburbanization_rec) %>%
   add_model(rand_mod)
 
 rand_cv <- rand_wf %>%
@@ -106,11 +194,11 @@ rand_final <- finalize_workflow(
 )
 
 rand_fit <- rand_final %>%
-  fit(data = crime_train)
+  fit(data = train)
 
 # Prediction
 rand_pred <- rand_fit %>%
-  predict(new_data = crime_test)
+  predict(new_data = test)
 ```
 
 ```{r}
@@ -120,7 +208,7 @@ knn_mod <- nearest_neighbor(neighbors = 5) %>%
   set_mode(mode = "regression")
 
 knn_wf <- workflow() %>%
-  add_recipe(crime_rec) %>%
+  add_recipe(suburbanization_rec) %>%
   add_model(knn_mod)
 
 knn_cv <- knn_wf %>%
@@ -135,9 +223,9 @@ knn_final <- finalize_workflow(
 )
 
 knn_fit <- knn_final %>%
-  fit(data = crime_train)
+  fit(data = train)
 
 # Prediction
 knn_pred <- knn_fit %>%
-  predict(new_data = crime_test)
+  predict(new_data = test)
 ```
