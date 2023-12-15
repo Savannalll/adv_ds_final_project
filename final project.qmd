@@ -1,5 +1,5 @@
 ---
-title: "assignment06"
+title: "Final Project"
 author: "Yixuan Li & Savanna Li"
 format: 
   html:
@@ -10,7 +10,9 @@ execute:
 bibliography: references.bib
 ---
 
-## 
+## 0. Problem Description
+
+## 1. Data Preparation
 
 ```{r}
 library(tidyverse)
@@ -18,19 +20,26 @@ library(readr)
 library(here)
 library(tidymodels)
 library(haven)
+library(earth)
+library(vip)
 ```
 
 ```{r}
 # Import and tidy the data
 original_data <- read_csv(
-  here("data", "final_cc_data.csv"))
+  here("data", "final_cc_data.csv")) %>%
+  mutate(sub_pro = tot_ncc_oripop_corr / (tot_cc_oripop_corr + tot_ncc_oripop_corr))
 
 # intuitively pick predictors
 final_cc_data <- read_csv(
   here("data", "final_cc_data.csv")) %>%
   select(fipsplace_00, year, tot_cc_oripop_corr, tot_ncc_oripop_corr,
-         totnpcc_cc_offenses_vc, totnpcc_ncc_offenses_vc, pctblk, rays_planc, racc)
+         totnpcc_cc_offenses_vc, totnpcc_ncc_offenses_vc, pctblk) %>%
+  mutate(sub_pro = tot_ncc_oripop_corr / (tot_cc_oripop_corr + tot_ncc_oripop_corr))
+```
 
+```{r}
+# Other Predictors
 lead <- read_csv(
   here("data", "final_cc_data.csv")) %>%
   select(fipsplace_00, year, ph1_plc_wtm_wtm_0_r, tetra_corr) %>%
@@ -40,140 +49,174 @@ lead <- read_csv(
 cbp <- read_dta("data/data_cbp.dta") %>%
   select(fipsplace_00, year, perc_empl_ctycc_sic0)
 
-income <- read_dta("data/LR_income.dta")
+income <- read_dta("data/LR_income.dta") %>%
+  select(fipsplace_00, year, income)
 
 shblack <- read_dta("data/LR_shblack.dta")
 
-# only selected predictors
+```
+
+```{r}
+# Combine data sets
 combined_data <- final_cc_data %>%
   left_join(cbp, by = c("fipsplace_00", "year")) %>%
   left_join(income, by = c("fipsplace_00", "year")) %>%
   left_join(shblack, by = c("fipsplace_00", "year")) %>%
-  left_join(lead, by = c("fipsplace_00" = "fipsplace_00", "year" = "cor_year"))
+  left_join(lead, by = c("fipsplace_00" = "fipsplace_00", "year" = "cor_year")) %>%
+  select(-tot_cc_oripop_corr, -tot_ncc_oripop_corr) %>%
+  filter(!is.na(sub_pro))
 
-# all the variables (random forest importance)
+train <- 
+  combined_data %>%
+  filter(year >= 1979 & year <= 2007)
+
+test <- combined_data %>%
+  filter(year >= 2008 & year <= 2014)
+
+# all the variables (random forest importance) 
 total_combined_data <- original_data %>%
   left_join(cbp, by = c("fipsplace_00", "year")) %>%
   left_join(income, by = c("fipsplace_00", "year")) %>%
   left_join(shblack, by = c("fipsplace_00", "year")) %>%
-  left_join(lead, by = c("fipsplace_00" = "fipsplace_00", "year" = "cor_year"))
-  
+  left_join(lead, by = c("fipsplace_00" = "fipsplace_00", "year" = "cor_year")) %>%
+  select(-tot_cc_oripop_corr, -tot_ncc_oripop_corr) %>%
+  filter(!is.na(sub_pro)) %>%
+  select_if(is.numeric) %>%
+  select(-cpctfst, -auto, -empag, -empbus, -empcon, -emped, -empfire, -empgov, -empman, -empmin, -emppro,
+         -empser, -emptcpu, -emptrd, -exphwy, -medage, -pct5s, -pctfst, -pctoth, -school)
+# These are columns with too many missing values
 
+train_total <- total_combined_data %>%
+  filter(year >= 1979 & year <= 2007)
+
+test_total <- total_combined_data %>%
+  filter(year >= 2008 & year <= 2014)
 ```
 
 ```{r}
-# Split the data
-set.seed(20231201)
-crime_split <- initial_split(data = final_cc_data, prop = 0.75)
-crime_train <- training(x = crime_split)
-crime_test <- training(x = crime_split)
+suburbanization_rec <- 
+  recipe(formula = sub_pro ~., train) %>%
+  add_role(fipsplace_00,
+           year,
+           new_role = "id") %>%
+  step_rm(has_role("id")) %>%
+  step_impute_median(all_predictors())
+
+folds <- vfold_cv(data = train, v = 10)
 ```
 
 ```{r}
-# EDA
-crime_train %>%
-  ggplot(aes(x = tetra_corr, y = totnpcc_cc_offenses_vc)) +
-  geom_point() +
-  labs(title = "Lead Amount and Violent Crime per Inhabitant in the City Center")
+suburbanization_rec_total <- 
+  recipe(formula = sub_pro ~., train_total) %>%
+  add_role(fipsplace_00,
+           year,
+           new_role = "id") %>%
+  step_rm(has_role("id")) %>%
+  step_impute_median(all_predictors())
 
-crime_train %>%
-  ggplot(aes(x = tetra_corr, y = totnpcc_ncc_offenses_vc)) +
-  geom_point() +
-  labs(title = "Lead Amount and Violent Crime per Inhabitant in the Suburb")
+folds_total <- vfold_cv(data = train_total, v = 10)
 ```
 
-```{r}
-# Preparation
-crime_rec <- recipe(formula = totnpcc_cc_offenses_vc ~., data = crime_train)
-
-folds <- vfold_cv(data = crime_train, v = 10)
-```
+## Linear Regression
 
 ```{r}
-# Linear Regression Model
-lm_mod <- linear_reg() %>%
+# Linear Regression
+lm_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
   set_engine(engine = "lm")
 
 lm_wf <- workflow() %>%
-  add_recipe(crime_rec) %>%
-  add_model(lm_mod)
+  add_recipe(recipe = suburbanization_rec) %>%
+  add_model(spec = lm_mod)
+  
+lm_resamples <- lm_wf %>%
+  fit_resamples(
+    resamples = folds)
 
-lm_cv <- lm_wf %>%
-  fit_resamples(resamples = folds)
+collect_metrics(lm_resamples)
+```
 
-lm_best <- lm_cv %>%
-  select_best(metric = "rmse")
+## Random Forest
 
-lm_final <- finalize_workflow(
-  lm_wf,
-  parameters = lm_best
+```{r}
+# random forest model: tuning
+rf_mod <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 200
+  ) |>
+  set_mode(mode = "regression") |>
+  set_engine(
+    engine = "ranger", 
+    importance = "impurity",
+    num.threads = 4
+  )
+
+rf_wf <- workflow() |>
+  add_recipe(suburbanization_rec_total) |>
+  add_model(rf_mod)
+
+rf_grid <- grid_regular(
+  mtry(range = c(1, 15)),
+  min_n(range = c(1, 15)),
+  levels = 5
 )
 
-lm_fit <- lm_final %>%
-  fit(data = crime_train)
+rf_resamples <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = rf_grid
+)
 
-# Prediction
-lm_pred <- lm_fit %>%
-  predict(new_data = crime_test)
+collect_metrics(rf_resamples)
+
+show_best(rf_resamples)
+
+autoplot(rf_resamples)
 ```
 
 ```{r}
-# Random Forest Model
-rand_mod <- rand_forest(mode = "regression", trees = 500) %>%
-  set_engine("ranger")
+# the best random forest model
+rf_mod <- 
+  rand_forest(
+  trees = 200,
+  mtry = 15,
+  min_n = 1
+) |>
+  set_mode(mode = "regression") |>
+  set_engine(
+    engine = "ranger", 
+    importance = "impurity",
+    num.threads = 4
+  )
 
-rand_wf <- workflow() %>%
-  add_recipe(crime_rec) %>%
-  add_model(rand_mod)
+rf_wf <- 
+  workflow() |>
+  add_recipe(suburbanization_rec_total) |>
+  add_model(rf_mod)
 
-rand_cv <- rand_wf %>%
+rf_resamples <- 
+  rf_wf |>
   fit_resamples(resamples = folds)
 
-rand_best <- rand_cv %>%
-  select_best(metric = "rmse")
+collect_metrics(rf_resamples)
 
-rand_final <- finalize_workflow(
-  rand_wf,
-  parameters = rand_best
-)
-
-rand_fit <- rand_final %>%
-  fit(data = crime_train)
-
-# Prediction
-rand_pred <- rand_fit %>%
-  predict(new_data = crime_test)
 ```
 
 ```{r}
-# KNN Model
-knn_mod <- nearest_neighbor(neighbors = 5) %>%
-  set_engine(engine = "kknn") %>%
-  set_mode(mode = "regression")
+# variable importance
+rf_final <- 
+  rf_wf |>
+  fit(train_total) 
 
-knn_wf <- workflow() %>%
-  add_recipe(crime_rec) %>%
-  add_model(knn_mod)
-
-knn_cv <- knn_wf %>%
-  fit_resamples(resamples = folds)
-
-knn_best <- knn_cv %>%
-  select_best(metric = "rmse")
-
-knn_final <- finalize_workflow(
-  knn_wf,
-  parameters = knn_best
-)
-
-knn_fit <- knn_final %>%
-  fit(data = crime_train)
-
-# Prediction
-knn_pred <- knn_fit %>%
-  predict(new_data = crime_test)
-```
-
-```{r}
-
+rf_final |>
+  extract_fit_parsnip() |>
+  vip(num_features = 20) %>%
+  .$data |>
+  mutate(
+    Importance = Importance / max(Importance),
+    Variable = fct_reorder(.x = Importance, .f = Variable)
+  ) |>
+  ggplot(aes(Importance, Variable)) +
+  geom_col()
 ```
