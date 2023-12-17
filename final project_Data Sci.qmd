@@ -1,0 +1,409 @@
+---
+title: "Final Project"
+author: "Yixuan Li & Savanna Li"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+execute:
+  warning: false
+bibliography: references.bib
+---
+
+## 0. Problem Formulation
+
+Our topic is inspired by a paper on the "white flight" phenomenon. The term "white flight" refers to the historical phenomenon observed primarily in the mid-20th century in various American cities, where white residents moved away from urban neighborhoods at a time when Black or other minority populations were moving in. 
+
+The paper concludes the process of suburbanization can be explained by the rise of violent crime in city centers. Using data for more than 300 U.S. cities, results show that the increase in violent crime from the level in 1960 to its maximum in 1991 decreased the proportion of people living in city centers by 15 percentage points. Soil data that indicates lead level is included here due to its effects on crime rate 19 years later. Medical literature recognizes that exposure to lead as a child alters the formation of the brain and increases aggressive behaviour in adulthood.
+
+We gather crime data from FBI which span from 1960 to 2014, as well as lead, population, income, employment, and black population data in the same time period.
+
+## 1. Data Preparation
+
+```{r}
+library(tidyverse)
+library(readr)
+library(here)
+library(tidymodels)
+library(haven)
+library(earth)
+library(vip)
+library(doParallel)
+library(doFuture)
+```
+
+```{r}
+# Import and tidy the data
+original_data <- read_csv(
+  here("data", "final_cc_data.csv")) %>%
+  mutate(sub_pro = tot_ncc_oripop_corr / (tot_cc_oripop_corr + tot_ncc_oripop_corr))
+
+# other predictors
+lead <- read_csv(
+  here("data", "final_cc_data.csv")) %>%
+  select(fipsplace_00, year, ph1_plc_wtm_wtm_0_r, tetra_corr) %>%
+  mutate(cor_year = year + 19) %>%
+  select(!year)
+
+cbp <- read_dta("data/data_cbp.dta") %>%
+  select(fipsplace_00, year, perc_empl_ctycc_sic0)
+
+income <- read_dta("data/LR_income.dta") %>%
+  select(fipsplace_00, year, income)
+
+shblack <- read_dta("data/LR_shblack.dta")
+
+# all the variables
+total_combined_data <- original_data %>%
+  left_join(cbp, by = c("fipsplace_00", "year")) %>%
+  left_join(income, by = c("fipsplace_00", "year")) %>%
+  left_join(shblack, by = c("fipsplace_00", "year")) %>%
+  left_join(lead, by = c("fipsplace_00" = "fipsplace_00", "year" = "cor_year")) %>%
+  select(-tot_cc_oripop_corr, -tot_ncc_oripop_corr) %>%
+  filter(!is.na(sub_pro)) %>%
+  select_if(is.numeric) %>%
+  select(-cpctfst, -auto, -empag, -empbus, -empcon, -emped, -empfire, -empgov, -empman,
+         -empmin, -emppro, -empser, -emptcpu, -emptrd, -exphwy, -medage, -pct5s, -pctfst,
+         -pctoth, -school)
+# These are columns with too many missing values
+
+train_total <- total_combined_data %>%
+  filter(year >= 1979 & year <= 2007)
+
+test_total <- total_combined_data %>%
+  filter(year >= 2008 & year <= 2014)
+```
+
+According to United States Department of Justice in 1965, people with 19 years old had the highest arrest rates for violent crimes. Therefore, we manipulated the year lead of lead to match its amount to the crime rate 19 year later. We have 30 years of matched data and use first 80% of data from 1979 to 2007 as training data and 20% data from 2008 to 2014 as testing data.
+
+## 2. Choosing Predictors
+
+### 2.1 Random Forest Variable Importance
+
+```{r}
+# Create a random forest recipe
+suburbanization_rec_total <- 
+  recipe(formula = sub_pro ~., train_total) %>%
+  add_role(fipsplace_00,
+           year,
+           new_role = "id") %>%
+  step_rm(has_role("id")) %>%
+  step_impute_median(all_predictors())
+
+folds_total <- vfold_cv(data = train_total, v = 10)
+```
+
+```{r}
+# random forest model: tuning
+rf_mod <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 200
+  ) |>
+  set_mode(mode = "regression") |>
+  set_engine(
+    engine = "ranger", 
+    importance = "impurity",
+    num.threads = 4
+  )
+
+rf_wf <- workflow() |>
+  add_recipe(suburbanization_rec_total) |>
+  add_model(rf_mod)
+
+rf_grid <- grid_regular(
+  mtry(range = c(1, 15)),
+  min_n(range = c(1, 15)),
+  levels = 5
+)
+
+rf_resamples <- tune_grid(
+  rf_wf,
+  resamples = folds_total,
+  grid = rf_grid
+)
+
+show_best(rf_resamples)
+```
+
+```{r}
+# the best random forest model
+rf_mod <- 
+  rand_forest(
+  trees = 200,
+  mtry = 15,
+  min_n = 1
+) |>
+  set_mode(mode = "regression") |>
+  set_engine(
+    engine = "ranger", 
+    importance = "impurity",
+    num.threads = 4
+  )
+
+rf_wf <- 
+  workflow() |>
+  add_recipe(suburbanization_rec_total) |>
+  add_model(rf_mod)
+
+rf_final <- 
+  rf_wf |>
+  fit(train_total) 
+
+rf_final |>
+  extract_fit_parsnip() |>
+  vip(num_features = 20) %>%
+  .$data |>
+  mutate(
+    Importance = Importance / max(Importance),
+    Variable = fct_reorder(.x = Importance, .f = Variable)
+  ) |>
+  ggplot(aes(Importance, Variable)) +
+  geom_col()
+```
+
+Predictors with similar names are considered to be in one series, and two or more predictors from the same series would leads to Multicollinearity.
+
+Therefore, after using random forest to assess the variable importance, the most important variables we will pick are INTPTLON00, totn_ncc_offenses_21c, ALAND00, area_plc, ph1_plc_max_wtm_low_l.
+
+But this method is more about the relationship between each x and y individually (more about coefficients). To make our prediction of y more accurate, we need to consider how different predictors **work together** to contribute to y. So we decided to use PCA.
+
+### 2.2 Principal Component Analysis
+
+-   Delete the outcome variable: The data set to perform PCA should not contain the outcome variable, so we delete sub_pro from the data set.
+
+-   Impute missing values: Before performing the Principal Component Analysis, we need to impute the missing values. We tried median but it doesn't work because we have too many missing values in 512 columns. We are also unable to use na.omit() because this would make us have 0 left observations. Finally, we choose to calculate the mean for each column and use the result to impute missing values.
+
+-   Remove columns with 0 or constant variance: The variance for some columns is zero or constant, we need to remove these columns before we can perform PCA.
+
+```{r}
+# Principal Component Analysis
+train_total_pca <- train_total %>%
+  select(-sub_pro, -year, -fipsplace_00)
+
+sub_pro <- train_total %>%
+  select(sub_pro, year, fipsplace_00)
+
+# impute missing values
+for (col in names(train_total_pca)) {
+  if (any(is.na(train_total_pca[[col]]))) {
+    mean_val <- mean(train_total_pca[[col]], na.rm = TRUE)  
+    # remove NA and calculate the mean for each column
+    train_total[[col]][is.na(train_total_pca[[col]])] <- mean_val  
+    # use the calculated mean to impute the missing values
+  }
+}
+
+data_scaled <- scale(train_total_pca) 
+
+# further adjust the data set to perform PCA (exclude columns with variance = 0 or constant)
+constant_cols <- apply(data_scaled, 2, function(x) length(unique(x)) == 1)
+zero_variance_cols <- apply(data_scaled, 2, var) == 0
+
+cols_to_exclude <- which(constant_cols | zero_variance_cols)
+excluded_cols <- colnames(data_scaled)[cols_to_exclude]
+
+data_for_pca <- data_scaled[, -cols_to_exclude]
+
+# perform PCA
+pca_result <- prcomp(data_for_pca, center = TRUE, scale. = TRUE)
+
+```
+
+```{r}
+pca_result <- prcomp(data_for_pca, center = TRUE, scale. = TRUE)
+
+# transform the original data set
+pca_data <- predict(pca_result, newdata = train_total)
+
+# pick the most important 50 components
+important_pcs <- pca_data[, 1:50]
+
+# bind the outcome variable
+pca_df <- as.data.frame(important_pcs)
+
+final_df <- bind_cols(pca_df, sub_pro)
+```
+
+After performing Principal Component Analysis, we will pick the most important 50 components. Each of them is the linear combination of the original predictors.
+
+### 2.3 Finalize Predictors and Split Data into Training and Testing
+
+```{r}
+# split
+train <- 
+  final_df %>%
+  filter(year >= 1979 & year <= 2007)
+```
+
+Testing data will remain unchanged. We will transform it using PCA after we finalize the best model and are about to make final predictions on the testing data.
+
+## 3. Set up Resampling and a General Recipe
+
+```{r}
+suburbanization_rec <- 
+  recipe(formula = sub_pro ~., train) %>%
+  add_role(fipsplace_00,
+           year,
+           new_role = "id") %>%
+  step_rm(has_role("id")) %>%
+  step_impute_median(all_predictors())
+
+folds <- vfold_cv(data = train, v = 10)
+```
+
+## 4. Test Candidate Models
+
+Since our efficient data is fairly small and there's multicollinearity issue within predictors, we have to pick models with the regularization approach which work by adding a penalty to the model's loss function, which constrains or shrinks the coefficient estimates towards zero.
+
+-   **Ridge Regression**: Particularly effective against multicollinearity. It reduces the variance of the coefficients by shrinking them towards zero, but not exactly zero, which helps in stabilizing the estimates in the presence of correlated predictors.
+
+-   **Lasso Regression**: Work well to reduce multicollinearity, can help in identifying the most significant features by setting some coefficients to zero. 
+
+-   **Elastic Net Regression:** ENR includes both the L1 and L2 penalties, which helps in handling various types of data and correlation structures. Like Lasso, it can perform feature selection by shrinking some coefficients to zero. At the same time, it can handle correlated features more robustly (a limitation in Lasso) due to the Ridge component.
+
+### 4.1 Linear Regression
+
+```{r}
+# Linear Regression
+lm_mod <- linear_reg() |>
+  set_mode(mode = "regression") |>
+  set_engine(engine = "lm")
+
+lm_wf <- workflow() %>%
+  add_recipe(recipe = suburbanization_rec) %>%
+  add_model(spec = lm_mod)
+  
+lm_resamples <- lm_wf %>%
+  fit_resamples(
+    resamples = folds)
+
+collect_metrics(lm_resamples)
+```
+
+### 4.2 LASSO Regression
+
+```{r}
+# Set up parallel processing
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makeCluster(all_cores - 4L)
+registerDoParallel(cl)
+
+# Define the Lasso Regression fitting function with cross-validation
+fit_lasso <- function(data, penalty) {
+  
+  # Define the recipe
+  lasso_rec <- recipe(sub_pro ~ ., data = final_df) %>%
+    add_role(fipsplace_00, year, new_role = "id") %>%
+    step_rm(has_role("id")) %>%
+    step_normalize(all_predictors()) %>%
+    step_impute_mean(all_predictors())
+
+  # Define the model specification for Lasso
+  lasso_mod <- linear_reg(penalty = penalty, mixture = 1) %>%
+    set_mode("regression") %>%
+    set_engine("glmnet")
+
+  # Create the workflow
+  lasso_wf <- workflow() %>%
+    add_recipe(lasso_rec) %>%
+    add_model(lasso_mod)
+
+  # Perform 10-fold cross-validation
+  vfold_res <- vfold_cv(data, v = 10)
+  fit_res <- fit_resamples(lasso_wf, resamples = vfold_res)
+
+  # Extract and return the rmse
+  perf <- collect_metrics(fit_res)
+  rmse_val <- perf %>% filter(.metric == "rmse") %>% summarise(mean_rmse = mean(mean)) %>% pull(mean_rmse)
+  return(data.frame(penalty = penalty, rmse = rmse_val))
+}
+
+# Create a sequence of penalty values
+penalty_values <- seq(0, 50, 1)
+
+# Perform grid search using map_dfr to iterate over penalty values
+grid_results <- map_dfr(penalty_values, ~fit_lasso(final_df, .x))
+
+# Plot the results
+ggplot(grid_results, aes(x = penalty, y = rmse)) +
+  geom_line(alpha = 0.4) +
+  geom_point(data = filter(grid_results, penalty == 0), color = "red") +
+  labs(x = "Penalty", y = "RMSE", title = "Lasso Regression RMSE vs. Penalty")
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+
+```
+
+### 4.3 Ridge Regression
+
+```{r}
+
+# Set up parallel processing
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makeCluster(all_cores - 4L)
+registerDoParallel(cl)
+
+# Define the Ridge Regression fitting function with cross-validation
+fit_ridge <- function(data, penalty) {
+  
+  # Define the recipe
+  ridge_rec <- recipe(sub_pro ~ ., data = final_df) %>%
+    add_role(fipsplace_00, year, new_role = "id") %>%
+    step_rm(has_role("id")) %>%
+    step_normalize(all_predictors()) %>%
+    step_impute_median(all_predictors())
+
+  # Define the model specification
+  ridge_mod <- linear_reg(penalty = penalty, mixture = 0) %>%
+    set_mode("regression") %>%
+    set_engine("glmnet")
+
+  # Create the workflow
+  ridge_wf <- workflow() %>%
+    add_recipe(ridge_rec) %>%
+    add_model(ridge_mod)
+
+  # Perform 10-fold cross-validation
+  vfold_res <- vfold_cv(data, v = 10)
+  fit_res <- fit_resamples(ridge_wf, resamples = vfold_res)
+
+  # Extract and return the performance metric (e.g., RMSE)
+  perf <- collect_metrics(fit_res)
+  rmse_val <- perf %>% filter(.metric == "rmse") %>% summarise(mean_rmse = mean(mean)) %>% pull(mean_rmse)
+  return(data.frame(penalty = penalty, rmse = rmse_val))
+}
+
+# Create a sequence of penalty values
+penalty_values <- seq(0, 50, 1)
+
+# Perform grid search using map_dfr to iterate over penalty values
+grid_results <- map_dfr(penalty_values, ~fit_ridge(final_df, .x))
+
+# Plot the results
+ggplot(grid_results, aes(x = penalty, y = rmse)) +
+  geom_line(alpha = 0.4) +
+  geom_point(data = filter(grid_results, penalty == 0), color = "red") +
+  labs(x = "Penalty", y = "RMSE", title = "Ridge Regression RMSE vs. Penalty")
+
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+```
+
+## 5. Select the Best Model
+
+We choose to use RMSE to determine which model is the best because
+
+## 6. Limitation
+
+**(1) IMPUTATION:**
+
+We use mean to impute missing values.
+
+**ARIMA (AutoRegressive Integrated Moving Average):** ARIMA models are more sophisticated and can handle complex patterns in time series data. They combine autoregressive (AR) models, which predict future values based on past values, with moving average (MA) models, which account for the relationship between an observation and a residual error from a moving average model applied to lagged observations.
+
+**(2)**
